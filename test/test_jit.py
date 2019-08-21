@@ -1169,7 +1169,9 @@ graph(%x : Tensor,
                                                 observer._c,
                                                 observer._c)
         data = torch.randn(1, 3, 10, 10, dtype=torch.float)
-        m(data)
+        def get_forward(m):
+            return m._c._get_method('forward')
+        get_forward(m)(data)
         # right now this pass is mutating the original module
         # and it will have extra observer modules
         # will fix later when we figure out how to remove modules
@@ -1188,7 +1190,48 @@ graph(%x : Tensor,
                    .check_next("aten::int_repr") \
                    .check_next("aten::_dequantize_linear") \
                    .check("return") \
-                   .run(str(m._c._get_method('forward').graph))
+                   .run(str(get_forward(m).graph))
+
+    def test_quant_fusion(self):
+        class Observer(torch.nn.Module):
+            def __init__(self):
+                super(Observer, self).__init__()
+
+            def forward(self, x):
+                return x
+
+            @torch.jit.export
+            def calculate_qparams(self):
+                return torch.tensor([2.0]), torch.tensor([3])
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super(M, self).__init__()
+                self.conv = torch.nn.Conv2d(3, 5, 3).float()
+
+            def forward(self, x):
+                return self.conv(x)
+
+        m = torch.jit.script(M())
+        observer = torch.jit.script(Observer())
+        torch._C._jit_pass_constant_propagation(m.graph)
+        torch._C._jit_pass_prepare_quant(m._c, "forward",
+                                         observer._c,
+                                         observer._c)
+        data = torch.randn(1, 3, 10, 10, dtype=torch.float)
+        m(data)
+        m._c = torch._C._jit_pass_insert_quant_dequant(m._c, "forward")
+        m(data)
+        torch._C._jit_pass_quant_fusion(m.graph)
+        FileCheck().check("aten::quantize_linear") \
+                   .check("aten::quantize_linear") \
+                   .check("aten::quantize_linear") \
+                   .check("quantized::fbgemm_conv_prepack") \
+                   .check("quantized::fbgemm_conv2d") \
+                   .check("aten::int_repr") \
+                   .check_next("aten::_dequantize_linear") \
+                   .check("return") \
+                   .run(str(m.graph))
 
     def test_pattern_based_rewrite(self):
         # mul(mul(mul(mul(x,y),z),x),y) --> mul(mul(mulmul(x,y,z), x), y) -->
